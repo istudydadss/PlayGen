@@ -50,18 +50,26 @@
 </template>
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { recordingApi, projectApi } from '@/api'
 import { ElMessage } from 'element-plus'
+const router = useRouter()
 const recordings = ref<any[]>([])
 const projects = ref<any[]>([])
 const loading = ref(false)
 const showStartDialog = ref(false)
 const startForm = ref({ project_id: '', name: '', start_url: '' })
-const statusLabel = (s: string) => ({ idle:'待开始', recording:'录制中', paused:'已暂停', stopped:'已停止', analyzed:'已分析', error:'错误' }[s] || s)
-const statusType = (s: string) => ({ idle:'info', recording:'danger', paused:'warning', stopped:'', analyzed:'success', error:'danger' }[s] || '') as any
+const statusLabel = (s: string) => ({ idle:'待开始', recording:'录制中', paused:'已暂停', stopped:'已停止', analyzing:'分析中', analyzed:'已分析', error:'错误' }[s] || s)
+const statusType = (s: string) => ({ idle:'info', recording:'danger', paused:'warning', stopped:'', analyzing:'warning', analyzed:'success', error:'danger' }[s] || '') as any
 const fetchData = async () => { loading.value = true; try { const r = await recordingApi.list() as any; recordings.value = r.items || [] } finally { loading.value = false } }
 const fetchProjects = async () => { const r = await projectApi.list() as any; projects.value = r.items || [] }
-const startRecording = async () => { await recordingApi.start(startForm.value); ElMessage.success('录制已创建'); showStartDialog.value = false; fetchData() }
+const startRecording = async () => {
+  const result = await recordingApi.start(startForm.value) as any
+  ElMessage.success('录制已创建，正在启动浏览器...')
+  showStartDialog.value = false
+  // 跳转到录制详情页，可以看到实时流量和 CDP 地址
+  router.push(`/recordings/${result.id}`)
+}
 const pauseRecording = async (id: string) => { await recordingApi.pause(id); fetchData() }
 const resumeRecording = async (id: string) => { await recordingApi.resume(id); fetchData() }
 const stopRecording = async (id: string) => { await recordingApi.stop(id); ElMessage.success('已停止'); fetchData() }

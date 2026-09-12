@@ -1,6 +1,6 @@
 """PlayGen - FastAPI 应用入口"""
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import structlog
 
@@ -47,6 +47,23 @@ app.add_middleware(
 from app.api.v1.router import api_router
 
 app.include_router(api_router, prefix=settings.API_PREFIX)
+
+
+# ========== WebSocket 端点 ==========
+
+@app.websocket("/ws/recording/{session_id}")
+async def recording_websocket(websocket: WebSocket, session_id: str):
+    """录制实时流量推送 WebSocket"""
+    from app.services.websocket_manager import ws_manager
+    await ws_manager.connect(websocket, session_id)
+    try:
+        while True:
+            # 保持连接，接收客户端心跳或指令
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket, session_id)
 
 
 @app.get("/health")

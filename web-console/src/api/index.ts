@@ -42,6 +42,14 @@ export const recordingApi = {
   getTraffic: (id: string, params?: any) => api.get(`/recordings/${id}/traffic`, { params }),
   getTrafficDetail: (recordingId: string, recordId: string) => api.get(`/recordings/${recordingId}/traffic/${recordId}`),
   analyze: (id: string) => api.post(`/recordings/${id}/analyze`),
+  getStatus: (id: string) => api.get(`/recordings/${id}/status`),
+  /** 获取 WebSocket 连接 URL */
+  getWsUrl: (id: string) => {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const host = window.location.hostname
+    const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80')
+    return `${protocol}//${host}:${port}/ws/recording/${id}`
+  },
 }
 
 // ========== 接口资产 ==========

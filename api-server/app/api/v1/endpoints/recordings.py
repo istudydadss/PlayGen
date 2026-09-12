@@ -1,5 +1,5 @@
 """录制管理 API"""
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from datetime import datetime
@@ -12,13 +12,18 @@ from app.schemas.recording import (
     RecordingCreate, RecordingResponse, RecordingListResponse,
     TrafficRecordResponse, TrafficDetailResponse, TrafficListResponse,
 )
+from app.services.recording_service import recording_service
 
 router = APIRouter()
 
 
 @router.post("", response_model=RecordingResponse, status_code=201)
-async def start_recording(data: RecordingCreate, db: AsyncSession = Depends(get_db)):
-    """启动录制"""
+async def start_recording(
+    data: RecordingCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """启动录制 - 通过 CDP 连接 Chrome 浏览器"""
     project = await db.get(Project, data.project_id)
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
@@ -36,9 +41,26 @@ async def start_recording(data: RecordingCreate, db: AsyncSession = Depends(get_
     await db.flush()
     await db.refresh(session)
 
-    # TODO: 通过 Celery 异步启动 Playwright 采集器
-    # from app.celery_app import start_recording_task
-    # start_recording_task.delay(str(session.id))
+    session_id_str = str(session.id)
+
+    # 通过 BackgroundTasks 在后台启动 Playwright 采集器
+    # 使用 BackgroundTasks 确保响应先返回，不阻塞客户端
+    async def _start():
+        try:
+            await recording_service.start_recording(session_id_str, session)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"启动录制失败: {e}")
+            # 更新数据库状态为错误
+            from app.database import async_session_factory
+            async with async_session_factory() as err_db:
+                err_session = await err_db.get(RecordingSession, session.id)
+                if err_session:
+                    err_session.status = RecordingStatus.ERROR
+                    err_session.error_message = str(e)
+                    await err_db.commit()
+
+    background_tasks.add_task(_start)
 
     return session
 
@@ -52,8 +74,14 @@ async def pause_recording(recording_id: UUID, db: AsyncSession = Depends(get_db)
     if session.status != RecordingStatus.RECORDING:
         raise HTTPException(status_code=400, detail="当前状态不允许暂停")
 
-    session.status = RecordingStatus.PAUSED
-    await db.flush()
+    session_id_str = str(recording_id)
+
+    # 检查录制是否在活跃列表中
+    if not recording_service.is_recording_active(session_id_str):
+        raise HTTPException(status_code=400, detail="录制进程不存在，可能已异常退出")
+
+    await recording_service.pause_recording(session_id_str)
+
     await db.refresh(session)
     return session
 
@@ -67,14 +95,23 @@ async def resume_recording(recording_id: UUID, db: AsyncSession = Depends(get_db
     if session.status != RecordingStatus.PAUSED:
         raise HTTPException(status_code=400, detail="当前状态不允许继续")
 
-    session.status = RecordingStatus.RECORDING
-    await db.flush()
+    session_id_str = str(recording_id)
+
+    if not recording_service.is_recording_active(session_id_str):
+        raise HTTPException(status_code=400, detail="录制进程不存在，可能已异常退出")
+
+    await recording_service.resume_recording(session_id_str)
+
     await db.refresh(session)
     return session
 
 
 @router.post("/{recording_id}/stop", response_model=RecordingResponse)
-async def stop_recording(recording_id: UUID, db: AsyncSession = Depends(get_db)):
+async def stop_recording(
+    recording_id: UUID,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
     """停止录制并触发分析"""
     session = await db.get(RecordingSession, recording_id)
     if not session:
@@ -82,16 +119,27 @@ async def stop_recording(recording_id: UUID, db: AsyncSession = Depends(get_db))
     if session.status not in (RecordingStatus.RECORDING, RecordingStatus.PAUSED):
         raise HTTPException(status_code=400, detail="当前状态不允许停止")
 
-    session.status = RecordingStatus.STOPPED
-    session.stopped_at = datetime.utcnow()
-    await db.flush()
+    session_id_str = str(recording_id)
 
-    # TODO: 触发分析任务
-    # from app.celery_app import analyze_recording_task
-    # analyze_recording_task.delay(str(session.id))
+    # 停止录制（关闭浏览器）
+    if recording_service.is_recording_active(session_id_str):
+        await recording_service.stop_recording(session_id_str)
+    else:
+        # 录制进程可能已异常退出，直接更新状态
+        session.status = RecordingStatus.STOPPED
+        session.stopped_at = datetime.utcnow()
+        await db.flush()
 
-    session.status = RecordingStatus.ANALYZED
-    await db.flush()
+    # 异步触发分析（通过 Celery 或直接后台任务）
+    async def _analyze():
+        try:
+            await recording_service.analyze_recording(session_id_str)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"分析失败: {e}")
+
+    background_tasks.add_task(_analyze)
+
     await db.refresh(session)
     return session
 
@@ -167,7 +215,11 @@ async def get_traffic_detail(
 
 
 @router.post("/{recording_id}/analyze")
-async def trigger_analysis(recording_id: UUID, db: AsyncSession = Depends(get_db)):
+async def trigger_analysis(
+    recording_id: UUID,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
     """重新触发分析"""
     session = await db.get(RecordingSession, recording_id)
     if not session:
@@ -178,11 +230,29 @@ async def trigger_analysis(recording_id: UUID, db: AsyncSession = Depends(get_db
     session.status = RecordingStatus.ANALYZING
     await db.flush()
 
-    # TODO: 触发分析任务
-    # from app.celery_app import analyze_recording_task
-    # analyze_recording_task.delay(str(session.id))
+    session_id_str = str(recording_id)
 
-    session.status = RecordingStatus.ANALYZED
-    await db.flush()
+    async def _analyze():
+        try:
+            await recording_service.analyze_recording(session_id_str)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"分析失败: {e}")
+
+    background_tasks.add_task(_analyze)
 
     return {"message": "分析任务已触发", "session_id": str(recording_id)}
+
+
+@router.get("/{recording_id}/status")
+async def get_recording_status(recording_id: UUID):
+    """获取录制实时状态（含 CDP URL）"""
+    session_id_str = str(recording_id)
+    is_active = recording_service.is_recording_active(session_id_str)
+    cdp_url = recording_service.get_cdp_url(session_id_str)
+
+    return {
+        "session_id": session_id_str,
+        "is_active": is_active,
+        "cdp_url": cdp_url,
+    }
