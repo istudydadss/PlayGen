@@ -1,4 +1,7 @@
 """录制管理 API"""
+import logging
+import traceback
+
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -15,6 +18,7 @@ from app.schemas.recording import (
 from app.services.recording_service import recording_service
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("", response_model=RecordingResponse, status_code=201)
@@ -43,21 +47,18 @@ async def start_recording(
 
     session_id_str = str(session.id)
 
-    # 通过 BackgroundTasks 在后台启动 Playwright 采集器
-    # 使用 BackgroundTasks 确保响应先返回，不阻塞客户端
     async def _start():
         try:
             await recording_service.start_recording(session_id_str, session)
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"启动录制失败: {e}")
-            # 更新数据库状态为错误
+            error_detail = traceback.format_exc()
+            logger.error(f"启动录制失败: {error_detail}")
             from app.database import async_session_factory
             async with async_session_factory() as err_db:
                 err_session = await err_db.get(RecordingSession, session.id)
                 if err_session:
                     err_session.status = RecordingStatus.ERROR
-                    err_session.error_message = str(e)
+                    err_session.error_message = error_detail[-500:]
                     await err_db.commit()
 
     background_tasks.add_task(_start)
@@ -130,13 +131,12 @@ async def stop_recording(
         session.stopped_at = datetime.utcnow()
         await db.flush()
 
-    # 异步触发分析（通过 Celery 或直接后台任务）
+    # 异步触发分析（纯数据处理，不需要 Playwright）
     async def _analyze():
         try:
             await recording_service.analyze_recording(session_id_str)
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"分析失败: {e}")
+            logger.error(f"分析失败: {e}")
 
     background_tasks.add_task(_analyze)
 

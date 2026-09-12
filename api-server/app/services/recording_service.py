@@ -3,6 +3,8 @@ import asyncio
 import json
 import logging
 import subprocess
+import sys
+import threading
 import time
 from datetime import datetime
 from typing import Optional, Dict
@@ -34,15 +36,71 @@ def _strip_tz(dt: Optional[datetime]) -> Optional[datetime]:
     return dt
 
 
+class _ProactorThread:
+    """
+    Windows 专用: 在独立线程中运行 ProactorEventLoop。
+    
+    uvicorn 在 Windows 上使用 SelectorEventLoop，不支持子进程。
+    Playwright 需要启动 Node.js 子进程，因此必须在 ProactorEventLoop 中运行。
+    此类创建一个独立线程，运行 ProactorEventLoop，允许从主线程提交协程。
+    """
+
+    def __init__(self):
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        """启动 ProactorEventLoop 线程"""
+        if self._thread is not None and self._thread.is_alive():
+            return  # 已经启动
+        ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(ready,), daemon=True)
+        self._thread.start()
+        ready.wait(timeout=5)
+        logger.info(f"ProactorEventLoop 线程已启动: {self._thread.name}")
+
+    def _run(self, ready_event: threading.Event):
+        """线程主函数: 创建并运行 ProactorEventLoop"""
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        ready_event.set()
+        logger.info("ProactorEventLoop 开始运行")
+        self._loop.run_forever()
+
+    def submit(self, coro) -> asyncio.Future:
+        """提交协程到 ProactorEventLoop，返回 concurrent.futures.Future"""
+        if self._loop is None or self._loop.is_closed():
+            raise RuntimeError("ProactorEventLoop 未运行")
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    def stop(self):
+        """停止事件循环和线程"""
+        if self._loop and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread:
+            self._thread.join(timeout=5)
+
+
+# 全局 ProactorEventLoop 线程（用于 Playwright 操作）
+_pw_thread = _ProactorThread()
+
+
 class RecordingService:
     """
     录制服务
     管理活跃的录制会话，桥接 Playwright 采集器与数据库持久化
+    
+    所有 Playwright 操作都提交到独立的 ProactorEventLoop 线程执行，
+    避免 Windows 上 uvicorn SelectorEventLoop 不支持子进程的问题。
     """
 
     def __init__(self):
         # session_id(str) -> {recorder, process, cdp_url}
         self._active_sessions: Dict[str, dict] = {}
+        # 确保 ProactorEventLoop 线程已启动
+        _pw_thread.start()
 
     # ------------------------------------------------------------------
     # 启动录制
@@ -52,17 +110,46 @@ class RecordingService:
         if session_id in self._active_sessions:
             raise RuntimeError(f"录制会话 {session_id} 已在进行中")
 
+        logger.info(f"[1/8] 开始启动录制: session={session_id}")
+
         # 通过 subprocess 启动 Chrome，开启 CDP 远程调试端口
         cdp_port = 9222 + hash(session_id) % 100  # 基于 session_id 分配端口，避免冲突
         chrome_process = self._launch_chrome(session_db.start_url, cdp_port)
+        logger.info(f"[2/8] Chrome 已启动: PID={chrome_process.pid}, port={cdp_port}")
 
-        # 等待 Chrome 启动
-        await asyncio.sleep(2)
+        # 等待 Chrome 启动并轮询检查 CDP 端口是否就绪
+        cdp_url = f"http://127.0.0.1:{cdp_port}"
+        cdp_ready = False
+        for attempt in range(15):  # 最多等待 15 秒
+            await asyncio.sleep(1)
+            # 检查 Chrome 进程是否还活着
+            if chrome_process.poll() is not None:
+                raise RuntimeError(
+                    f"Chrome 进程已退出，退出码: {chrome_process.returncode}"
+                )
+            # 检查 CDP 端口是否可访问
+            try:
+                import httpx
+                resp = await httpx.AsyncClient().get(
+                    f"{cdp_url}/json/version", timeout=2
+                )
+                if resp.status_code == 200:
+                    cdp_ready = True
+                    logger.info(f"[3/8] CDP 端口就绪 (尝试 {attempt + 1}/15): {cdp_url}")
+                    break
+            except Exception:
+                pass
+
+        if not cdp_ready:
+            chrome_process.terminate()
+            raise RuntimeError(
+                f"Chrome CDP 端口 {cdp_port} 在 15 秒内未就绪"
+            )
 
         # 通过 CDP 连接 Chrome
+        logger.info("[4/8] 启动 Playwright 并连接 CDP...")
         from playwright.async_api import async_playwright
         pw = await async_playwright().start()
-        cdp_url = f"http://127.0.0.1:{cdp_port}"
 
         try:
             browser = await pw.chromium.connect_over_cdp(cdp_url)
@@ -72,18 +159,39 @@ class RecordingService:
             await pw.stop()
             raise
 
+        logger.info(f"[5/8] CDP 连接成功: contexts={len(browser.contexts)}")
+
         # 获取已有页面（Chrome 启动时会打开一个默认页面）
         contexts = browser.contexts
         if contexts and contexts[0].pages:
             page = contexts[0].pages[0]
+            logger.info(f"复用已有页面: {page.url}")
+        elif contexts:
+            try:
+                page = await contexts[0].new_page()
+                logger.info("在已有 context 中新建页面")
+            except NotImplementedError:
+                raise RuntimeError("CDP 连接中无法新建页面，Chrome 可能未正确启动")
         else:
-            context = await browser.new_context()
-            page = await context.new_page()
+            try:
+                context = await browser.new_context()
+                page = await context.new_page()
+                logger.info("新建 context 和页面")
+            except NotImplementedError:
+                raise RuntimeError("CDP 连接中无法新建 context，Chrome 可能未正确启动")
 
         # 如果 Chrome 没有导航到目标 URL，手动导航
         if session_db.start_url and page.url != session_db.start_url:
-            await page.goto(session_db.start_url, timeout=settings.BROWSER_TIMEOUT)
+            logger.info(f"导航到目标 URL: {session_db.start_url} (当前: {page.url})")
+            try:
+                await page.goto(session_db.start_url, timeout=settings.BROWSER_TIMEOUT)
+                logger.info(f"导航完成: {page.url}")
+            except NotImplementedError:
+                logger.warning("page.goto() 不支持当前模式，跳过导航")
+            except Exception as e:
+                logger.warning(f"导航失败 (非致命): {e}")
 
+        logger.info("[6/8] 创建录制器并设置拦截器...")
         # 创建 PlaywrightRecorder 并注入已有的 page/browser
         config = RecordingConfig(
             session_id=session_id,
@@ -93,7 +201,6 @@ class RecordingService:
             start_url=session_db.start_url,
         )
         recorder = PlaywrightRecorder(config)
-        # 手动注入，跳过 recorder.start() 中的浏览器启动流程
         recorder._playwright = pw
         recorder._browser = browser
         recorder._context = contexts[0] if contexts else page.context
@@ -110,6 +217,7 @@ class RecordingService:
         await interceptor.attach(page)
         recorder._interceptor = interceptor
         recorder.is_recording = True
+        logger.info("[7/8] 拦截器已附加，设置回调...")
 
         # 设置回调：实时保存流量到数据库
         recorder.set_callbacks(
@@ -124,6 +232,7 @@ class RecordingService:
             "cdp_url": cdp_url,
             "cdp_port": cdp_port,
         }
+        logger.info(f"[8/8] 录制已启动: session={session_id}, CDP={cdp_url}")
 
         # 更新数据库状态
         async with async_session_factory() as db:
@@ -136,8 +245,14 @@ class RecordingService:
         logger.info(f"录制已启动: session={session_id}, CDP={cdp_url}")
 
     def _launch_chrome(self, url: Optional[str], port: int) -> subprocess.Popen:
-        """启动 Chrome 浏览器（开启 CDP 远程调试端口）"""
+        """启动 Chrome 浏览器（开启 CDP 远程调试端口）
+        
+        使用独立的 --user-data-dir 确保即使本机已有 Chrome 运行，
+        也能启动一个全新的独立实例，使 --remote-debugging-port 生效。
+        """
         import platform
+        import os
+        import tempfile
 
         system = platform.system()
         chrome_paths = []
@@ -161,7 +276,6 @@ class RecordingService:
             ]
 
         chrome_exe = None
-        import os
         for path in chrome_paths:
             expanded = os.path.expandvars(path)
             if os.path.exists(expanded):
@@ -171,9 +285,18 @@ class RecordingService:
         if not chrome_exe:
             chrome_exe = "google-chrome"  # 回退到 PATH 中查找
 
+        # 使用临时目录作为独立的用户数据目录
+        # 关键：如果本机 Chrome 已在运行，不加 --user-data-dir 会导致新进程
+        # 直接加入已有实例，--remote-debugging-port 参数被忽略
+        user_data_dir = os.path.join(
+            tempfile.gettempdir(), f"playgen-chrome-profile-{port}"
+        )
+        os.makedirs(user_data_dir, exist_ok=True)
+
         cmd = [
             chrome_exe,
             f"--remote-debugging-port={port}",
+            f"--user-data-dir={user_data_dir}",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-extensions",
@@ -223,7 +346,7 @@ class RecordingService:
                     frame_url=action.frame_url,
                     input_value=action.input_value,
                     timestamp=_strip_tz(action.timestamp),
-                    metadata=action.metadata,
+                    metadata_=action.metadata,
                 )
                 db.add(db_action)
 

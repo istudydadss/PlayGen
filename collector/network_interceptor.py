@@ -170,13 +170,26 @@ class NetworkInterceptor:
         # 清理
         self._request_start_times.pop(request_id, None)
 
-    async def _on_request_failed(self, request: Request, failure):
-        """请求失败处理"""
+    async def _on_request_failed(self, request: Request, *args):
+        """请求失败处理
+        
+        兼容不同 Playwright 版本：
+        - 旧版: requestfailed 事件传递 (request, failure)
+        - 新版: requestfailed 事件只传递 (request)，failure 通过 request.failure 获取
+        """
         request_id = request.url + "_" + str(id(request))
         event: Optional[NetworkEvent] = getattr(request, "_playgen_event", None)
 
+        # 兼容获取 failure 信息
+        failure = args[0] if args else getattr(request, "failure", None)
+        if failure is None:
+            try:
+                failure = request.failure
+            except Exception:
+                failure = "unknown"
+
         if event:
-            event.failure_reason = failure
+            event.failure_reason = str(failure) if failure else "unknown"
             event.response_at = datetime.utcnow()
             started_at = self._request_start_times.get(request_id)
             if started_at:

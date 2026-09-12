@@ -91,7 +91,7 @@ class PageAction(Base):
     frame_url: Mapped[str | None] = mapped_column(String(1000))
     input_value: Mapped[str | None] = mapped_column(Text)
     timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
-    metadata: Mapped[dict | None] = mapped_column(JSON)  # 额外信息
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSON)  # 额外信息
 
     # 关系
     session: Mapped["RecordingSession"] = relationship(back_populates="page_actions")
