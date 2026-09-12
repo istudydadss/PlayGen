@@ -1,0 +1,135 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: playgen-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-playgen}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-playgen123}
+      POSTGRES_DB: ${POSTGRES_DB:-playgen}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U playgen"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: playgen-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: playgen-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+
+  api-server:
+    build:
+      context: ./api-server
+      dockerfile: Dockerfile
+    container_name: playgen-api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-playgen}:${POSTGRES_PASSWORD:-playgen123}@postgres:5432/${POSTGRES_DB:-playgen}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      SECRET_KEY: ${SECRET_KEY:-playgen-secret-key-change-in-production}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./api-server:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  collector-worker:
+    build:
+      context: ./api-server
+      dockerfile: Dockerfile
+    container_name: playgen-collector
+    command: celery -A app.celery_app worker -Q collector -c 2 --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-playgen}:${POSTGRES_PASSWORD:-playgen123}@postgres:5432/${POSTGRES_DB:-playgen}
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./api-server:/app
+      - ./collector:/app/collector
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  execution-worker:
+    build:
+      context: ./api-server
+      dockerfile: Dockerfile
+    container_name: playgen-executor
+    command: celery -A app.celery_app worker -Q execution -c 4 --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-playgen}:${POSTGRES_PASSWORD:-playgen123}@postgres:5432/${POSTGRES_DB:-playgen}
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./api-server:/app
+      - ./executor:/app/executor
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  scheduler:
+    build:
+      context: ./api-server
+      dockerfile: Dockerfile
+    container_name: playgen-scheduler
+    command: celery -A app.celery_app beat --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-playgen}:${POSTGRES_PASSWORD:-playgen123}@postgres:5432/${POSTGRES_DB:-playgen}
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./api-server:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web-console:
+    build:
+      context: ./web-console
+      dockerfile: Dockerfile
+    container_name: playgen-web
+    ports:
+      - "3000:80"
+    depends_on:
+      - api-server
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
