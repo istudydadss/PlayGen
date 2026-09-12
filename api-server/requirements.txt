@@ -1,0 +1,40 @@
+# Core
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+
+# Database
+sqlalchemy[asyncio]==2.0.35
+asyncpg==0.29.0
+alembic==1.13.3
+greenlet==3.1.1
+
+# Redis & Celery
+redis==5.1.1
+celery[redis]==5.4.0
+
+# Playwright
+playwright==1.47.0
+
+# HTTP Client
+httpx==0.27.2
+
+# Template Engine
+jinja2==3.1.4
+
+# YAML
+pyyaml==6.0.2
+
+# JSONPath
+jsonpath-ng==1.6.1
+
+# Object Storage
+minio==7.2.9
+
+# Utils
+python-multipart==0.0.12
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+structlog==24.4.0
