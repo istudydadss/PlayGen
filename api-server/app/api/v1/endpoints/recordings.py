@@ -1,0 +1,188 @@
+"""录制管理 API"""
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from datetime import datetime
+from uuid import UUID
+
+from app.database import get_db
+from app.models.recording import RecordingSession, NetworkRecord, RecordingStatus
+from app.models.project import Project
+from app.schemas.recording import (
+    RecordingCreate, RecordingResponse, RecordingListResponse,
+    TrafficRecordResponse, TrafficDetailResponse, TrafficListResponse,
+)
+
+router = APIRouter()
+
+
+@router.post("", response_model=RecordingResponse, status_code=201)
+async def start_recording(data: RecordingCreate, db: AsyncSession = Depends(get_db)):
+    """启动录制"""
+    project = await db.get(Project, data.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    session = RecordingSession(
+        project_id=data.project_id,
+        environment_id=data.environment_id,
+        name=data.name,
+        browser=data.browser,
+        start_url=data.start_url,
+        capture_trace=data.capture_trace,
+        status=RecordingStatus.IDLE,
+    )
+    db.add(session)
+    await db.flush()
+    await db.refresh(session)
+
+    # TODO: 通过 Celery 异步启动 Playwright 采集器
+    # from app.celery_app import start_recording_task
+    # start_recording_task.delay(str(session.id))
+
+    return session
+
+
+@router.post("/{recording_id}/pause", response_model=RecordingResponse)
+async def pause_recording(recording_id: UUID, db: AsyncSession = Depends(get_db)):
+    """暂停录制"""
+    session = await db.get(RecordingSession, recording_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="录制会话不存在")
+    if session.status != RecordingStatus.RECORDING:
+        raise HTTPException(status_code=400, detail="当前状态不允许暂停")
+
+    session.status = RecordingStatus.PAUSED
+    await db.flush()
+    await db.refresh(session)
+    return session
+
+
+@router.post("/{recording_id}/resume", response_model=RecordingResponse)
+async def resume_recording(recording_id: UUID, db: AsyncSession = Depends(get_db)):
+    """继续录制"""
+    session = await db.get(RecordingSession, recording_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="录制会话不存在")
+    if session.status != RecordingStatus.PAUSED:
+        raise HTTPException(status_code=400, detail="当前状态不允许继续")
+
+    session.status = RecordingStatus.RECORDING
+    await db.flush()
+    await db.refresh(session)
+    return session
+
+
+@router.post("/{recording_id}/stop", response_model=RecordingResponse)
+async def stop_recording(recording_id: UUID, db: AsyncSession = Depends(get_db)):
+    """停止录制并触发分析"""
+    session = await db.get(RecordingSession, recording_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="录制会话不存在")
+    if session.status not in (RecordingStatus.RECORDING, RecordingStatus.PAUSED):
+        raise HTTPException(status_code=400, detail="当前状态不允许停止")
+
+    session.status = RecordingStatus.STOPPED
+    session.stopped_at = datetime.utcnow()
+    await db.flush()
+
+    # TODO: 触发分析任务
+    # from app.celery_app import analyze_recording_task
+    # analyze_recording_task.delay(str(session.id))
+
+    session.status = RecordingStatus.ANALYZED
+    await db.flush()
+    await db.refresh(session)
+    return session
+
+
+@router.get("", response_model=RecordingListResponse)
+async def list_recordings(
+    project_id: UUID = Query(None),
+    status: str = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    """查询录制列表"""
+    query = select(RecordingSession)
+    count_query = select(func.count()).select_from(RecordingSession)
+
+    if project_id:
+        query = query.where(RecordingSession.project_id == project_id)
+        count_query = count_query.where(RecordingSession.project_id == project_id)
+    if status:
+        query = query.where(RecordingSession.status == status)
+        count_query = count_query.where(RecordingSession.status == status)
+
+    total = (await db.execute(count_query)).scalar() or 0
+    query = query.order_by(RecordingSession.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    result = await db.execute(query)
+    items = list(result.scalars().all())
+
+    return RecordingListResponse(total=total, items=items)
+
+
+@router.get("/{recording_id}/traffic", response_model=TrafficListResponse)
+async def get_traffic(
+    recording_id: UUID,
+    is_business: bool = Query(None),
+    resource_type: str = Query(None),
+    method: str = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    """查询录制流量列表"""
+    query = select(NetworkRecord).where(NetworkRecord.session_id == recording_id)
+    count_query = select(func.count()).select_from(NetworkRecord).where(NetworkRecord.session_id == recording_id)
+
+    if is_business is not None:
+        query = query.where(NetworkRecord.is_business == is_business)
+        count_query = count_query.where(NetworkRecord.is_business == is_business)
+    if resource_type:
+        query = query.where(NetworkRecord.resource_type == resource_type)
+        count_query = count_query.where(NetworkRecord.resource_type == resource_type)
+    if method:
+        query = query.where(NetworkRecord.method == method.upper())
+        count_query = count_query.where(NetworkRecord.method == method.upper())
+
+    total = (await db.execute(count_query)).scalar() or 0
+    query = query.order_by(NetworkRecord.started_at.asc()).offset((page - 1) * page_size).limit(page_size)
+    result = await db.execute(query)
+    items = list(result.scalars().all())
+
+    return TrafficListResponse(total=total, items=items)
+
+
+@router.get("/{recording_id}/traffic/{record_id}", response_model=TrafficDetailResponse)
+async def get_traffic_detail(
+    recording_id: UUID, record_id: UUID, db: AsyncSession = Depends(get_db)
+):
+    """查询流量详情"""
+    record = await db.get(NetworkRecord, record_id)
+    if not record or record.session_id != recording_id:
+        raise HTTPException(status_code=404, detail="流量记录不存在")
+    return record
+
+
+@router.post("/{recording_id}/analyze")
+async def trigger_analysis(recording_id: UUID, db: AsyncSession = Depends(get_db)):
+    """重新触发分析"""
+    session = await db.get(RecordingSession, recording_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="录制会话不存在")
+    if session.status not in (RecordingStatus.STOPPED, RecordingStatus.ANALYZED):
+        raise HTTPException(status_code=400, detail="当前状态不允许分析")
+
+    session.status = RecordingStatus.ANALYZING
+    await db.flush()
+
+    # TODO: 触发分析任务
+    # from app.celery_app import analyze_recording_task
+    # analyze_recording_task.delay(str(session.id))
+
+    session.status = RecordingStatus.ANALYZED
+    await db.flush()
+
+    return {"message": "分析任务已触发", "session_id": str(recording_id)}
